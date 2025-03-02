@@ -1,90 +1,116 @@
 package usecase
 
 import (
-	"bytes"
-	"compiler-playground-api/internal/entity"
+	"compiler-playground-api/internal/domain"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
-	"os"
+	"io"
+	"log"
 	"os/exec"
-	"strings"
-	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-type CodeRepository interface {
-	SaveCodeMetadata(id, language string, createdAt string) error
-}
-
-type MinioService interface {
-	SaveFile(id, sourceCode string, userInput string) error
-	GetFile(id string) (string, string, error)
-}
-
 type CodeUseCase struct {
-	repo         CodeRepository
-	minioService MinioService
+	tempFileRepo domain.TempFileRepository
 }
 
-func NewCodeUseCase(repo CodeRepository, minioService MinioService) *CodeUseCase {
+func NewCodeUseCase(tempFileRepo domain.TempFileRepository) *CodeUseCase {
 	return &CodeUseCase{
-		repo:         repo,
-		minioService: minioService,
+		tempFileRepo: tempFileRepo,
 	}
 }
 
-func (uc *CodeUseCase) SaveCode(code *entity.Code) (string, error) {
-	if err := uc.minioService.SaveFile(code.ID, code.SourceCode, code.Input); err != nil {
-		return "", err
+func (c *CodeUseCase) ExecuteCode(ctx context.Context, msg domain.Message, conn *websocket.Conn) {
+	if msg.Type != "code" {
+		log.Printf("Expected code message, got %s", msg.Type)
+		return
 	}
 
-	if err := uc.repo.SaveCodeMetadata(code.ID, code.Language, code.CreatedAt.String()); err != nil {
-		return "", err
+	fileName, err := c.tempFileRepo.Create(msg.Content)
+	if err != nil {
+		log.Printf("Error creating temp file: %v", err)
+		return
+	}
+	defer c.tempFileRepo.Delete(fileName)
+
+	cmd := exec.CommandContext(ctx, "python3", fileName)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("Error creating stdin pipe: %v", err)
+		return
+	}
+	defer stdin.Close()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("Error creating stdout pipe: %v", err)
+		return
 	}
 
-	return code.ID, nil
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Printf("Error creating stderr pipe: %v", err)
+		return
+	}
+
+	go func() {
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("WebSocket read error: %v", err)
+				return
+			}
+
+			var msg struct {
+				Type    string `json:"type"`
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(message, &msg); err != nil {
+				log.Printf("JSON unmarshal error: %v", err)
+				continue
+			}
+
+			if msg.Type == "input" {
+				if _, err := stdin.Write([]byte(msg.Content + "\n")); err != nil {
+					log.Printf("Error writing to stdin: %v", err)
+					return
+				}
+				fmt.Println("input:", msg.Content)
+			}
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("Error starting command: %v", err)
+		return
+	}
+
+	go c.readPipe(stdout, conn, "output")
+	go c.readPipe(stderr, conn, "error")
+
+	if err := cmd.Wait(); err != nil {
+		log.Printf("Command execution error: %v", err)
+		return
+	}
 }
 
-func (uc *CodeUseCase) ExecuteCode(id string) (string, error) {
-	sourceCode, userInput, err := uc.minioService.GetFile(id)
-	if err != nil {
-		return "", err
+func (c *CodeUseCase) readPipe(pipe io.Reader, conn *websocket.Conn, msgType string) {
+	buffer := make([]byte, 1024)
+	for {
+		n, err := pipe.Read(buffer)
+		if n > 0 {
+			content := string(buffer[:n])
+			message := domain.Message{Type: msgType, Content: content}
+			messageJson, _ := json.Marshal(message)
+			if err := conn.WriteMessage(websocket.TextMessage, messageJson); err != nil {
+				log.Printf("WebSocket write error: %v", err)
+				return
+			}
+		}
+		if err != nil {
+			break
+		}
 	}
-
-	tmpFile, err := os.CreateTemp("", "python-*.py")
-	if err != nil {
-		return "", errors.New("failed to create temp file")
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.WriteString(sourceCode); err != nil {
-		return "", errors.New("failed to write source code to temp file")
-	}
-	if err := tmpFile.Close(); err != nil {
-		return "", errors.New("failed to close temp file")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "python3", tmpFile.Name())
-	cmd.Stdin = bytes.NewBufferString(userInput)
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	err = cmd.Run()
-	if err != nil {
-		return "", errors.New(stderr.String())
-	}
-
-	fmt.Println(out.String())
-
-	output := out.String()
-	if !strings.HasSuffix(output, "\n") {
-		output += "\n"
-	}
-
-	return output, nil
 }
